@@ -1,0 +1,16 @@
+POST http://localhost:3000/api/lead
+Content-Type: application/json
+User-Agent: test-agent
+
+{
+  "email": "test@example.com",
+  "phone": "+27 82 123 4567",
+  "first_name": "Cobus",
+  "last_name": "Pieterse",
+  "country": "ZA",
+  "event_id": "lead-1234",
+  "fbp": "fb.1.1690000000.1234567890",
+  "fbc": "fb.1.1690000000.ABCD",
+  "value": 0,
+  "currency": "ZAR"
+}
