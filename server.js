@@ -60,6 +60,7 @@ app.post('/api/lead', async (req, res) => {
       fbp,
       fbc,
       event_id,
+      external_id, 
       value = 0,
       currency = 'ZAR',
     } = req.body || {};
@@ -67,6 +68,7 @@ app.post('/api/lead', async (req, res) => {
     // Pull client hints from request if not provided
     const userAgent = req.get('User-Agent');
     const clientIp = req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.socket?.remoteAddress;
+    const referer = req.get('Referer');
 
     // Build user_data with hashed fields
     const userData = {
@@ -81,7 +83,8 @@ app.post('/api/lead', async (req, res) => {
       client_user_agent: userAgent,
       client_ip_address: clientIp,
       fbp: fbp || undefined,
-      fbc: fbc || undefined
+      fbc: fbc || undefined,
+      external_id: external_id || undefined
     };
 
     // Remove null/undefined
@@ -100,9 +103,17 @@ app.post('/api/lead', async (req, res) => {
       eventTime: Math.floor(Date.now() / 1000),
       eventId: event_id, // optional but recommended for dedup
       actionSource: 'website',
+      eventSourceUrl: referer, 
       userData,
       customData
     });
+
+     req.log.info({
+     event_id,
+     fbp_present: Boolean(userData.fbp),
+     fbc_present: Boolean(userData.fbc),
+      external_id_present: Boolean(userData.external_id)
+    }, 'CAPI lead incoming');
 
     res.json({ ok: true, meta: resp });
   } catch (err) {
