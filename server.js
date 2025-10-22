@@ -1,54 +1,7 @@
-import express from 'express';
-import cors from 'cors';
-import helmet from 'helmet';
-import rateLimit from 'express-rate-limit';
-import pino from 'pino';
-import pinoHttp from 'pino-http';
-import { config as dotenv } from 'dotenv';
-import { sendLeadToMeta } from './src/metaCapi.js';
-import { normalizeEmail, normalizePhone, normalizeText, hashIf } from './src/hash.js';
-
-dotenv();
-
-const {
-  META_ACCESS_TOKEN,
-  META_PIXEL_ID,
-  META_TEST_EVENT_CODE,
-  APP_PORT = 3000,
-  ALLOWED_ORIGINS = ''
-} = process.env;
-
-if (!META_ACCESS_TOKEN || !META_PIXEL_ID) {
-  console.warn('[WARN] META_ACCESS_TOKEN and META_PIXEL_ID must be set in .env');
-}
-
-const app = express();
-const logger = pino({ level: process.env.LOG_LEVEL || 'info' });
-
-app.use(pinoHttp({ logger }));
-app.use(helmet());
-app.use(express.json({ limit: '1mb' }));
-
-// CORS
-const allowed = ALLOWED_ORIGINS.split(',').map(s => s.trim()).filter(Boolean);
-app.use(cors({
-  origin: (origin, cb) => {
-    if (!origin) return cb(null, true); // allow mobile apps / curl
-    if (allowed.includes(origin)) return cb(null, true);
-    cb(new Error('Not allowed by CORS: ' + origin));
-  },
-  credentials: true
-}));
-
-// rate limit
-const limiter = rateLimit({ windowMs: 60 * 1000, max: 60 });
-app.use('/api/', limiter);
-
-app.get('/health', (req, res) => res.json({ ok: true }));
-
 app.post('/api/lead', async (req, res) => {
   try {
     const {
+      event_name = 'Lead',           // <-- allow Contact or Lead
       email,
       phone,
       first_name,
@@ -59,18 +12,38 @@ app.post('/api/lead', async (req, res) => {
       zip,
       fbp,
       fbc,
+      external_id,                   // RAW (unhashed)
       event_id,
-      external_id, 
-      value = 0,
-      currency = 'ZAR',
+      value,
+      currency
     } = req.body || {};
 
-    // Pull client hints from request if not provided
     const userAgent = req.get('User-Agent');
-    const clientIp = req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.socket?.remoteAddress;
+    const clientIp = req.headers['x-forwarded-for']?.split(',')[0]?.trim()
+                   || req.socket?.remoteAddress;
     const referer = req.get('Referer');
+    const nowSec = Math.floor(Date.now() / 1000);
 
-    // Build user_data with hashed fields
+    // --- fbc sanity (do NOT modify case or content; just validate) ---
+    let fbcSanitized = fbc || undefined;
+    let fbcCreation = null;
+    // Expected format: fb.1.<creation>.<fbclid>
+    const fbcMatch = typeof fbcSanitized === 'string'
+      ? fbcSanitized.match(/^fb\.1\.(\d+)\.(.+)$/)
+      : null;
+    if (fbcMatch) {
+      fbcCreation = parseInt(fbcMatch[1], 10);
+      // If creation is way in the future (>5 minutes), drop fbc for this event
+      if (Number.isFinite(fbcCreation) && fbcCreation > nowSec + 300) {
+        req.log.warn({ fbcCreation, nowSec, fbc: fbcSanitized }, 'Dropping fbc with future creation_time');
+        fbcSanitized = undefined;
+      }
+    } else if (fbcSanitized) {
+      req.log.warn({ fbc: fbcSanitized }, 'Dropping fbc with invalid format');
+      fbcSanitized = undefined;
+    }
+
+    // --- user_data (hash only the PII that Meta expects hashed) ---
     const userData = {
       em: hashIf(email, normalizeEmail),
       ph: hashIf(phone, normalizePhone),
@@ -82,50 +55,52 @@ app.post('/api/lead', async (req, res) => {
       zp: hashIf(zip, normalizeText),
       client_user_agent: userAgent,
       client_ip_address: clientIp,
-      fbp: fbp || undefined,
-      fbc: fbc || undefined,
-      external_id: external_id || undefined
+      fbp: fbp || undefined,          // RAW
+      fbc: fbcSanitized,              // RAW (possibly dropped above)
+      external_id: external_id || undefined  // RAW (unhashed)
     };
-
-    // Remove null/undefined
     Object.keys(userData).forEach(k => (userData[k] == null) && delete userData[k]);
 
-    const customData = {
-      value,
-      currency
-    };
+    // --- Only include valid value/currency ---
+    let customData = {};
+    const currencyOk = typeof currency === 'string' && /^[A-Z]{3}$/.test(currency.toUpperCase());
+    const valueOk = typeof value === 'number' && isFinite(value);
+    if (valueOk && currencyOk) {
+      customData.value = value;
+      customData.currency = currency.toUpperCase();
+    }
+    // else: omit both to avoid Diagnostics
+
+    req.log.info({
+      event_name,
+      event_id,
+      fbp_present: Boolean(userData.fbp),
+      fbc_present: Boolean(userData.fbc),
+      external_id_present: Boolean(userData.external_id),
+      custom_value: customData.value ?? null,
+      custom_currency: customData.currency ?? null
+    }, 'CAPI lead/contact incoming');
 
     const resp = await sendLeadToMeta({
       accessToken: META_ACCESS_TOKEN,
       pixelId: META_PIXEL_ID,
       testEventCode: META_TEST_EVENT_CODE,
-      eventName: 'Lead',
-      eventTime: Math.floor(Date.now() / 1000),
-      eventId: event_id, // optional but recommended for dedup
+      eventName: event_name,                  // <-- dynamic
+      eventTime: nowSec,                      // server-side event_time
+      eventId: event_id,                      // MUST match pixel eventID
       actionSource: 'website',
-      eventSourceUrl: referer, 
+      eventSourceUrl: referer,                // optional but good
       userData,
       customData
     });
 
-     req.log.info({
-     event_id,
-     fbp_present: Boolean(userData.fbp),
-     fbc_present: Boolean(userData.fbc),
-      external_id_present: Boolean(userData.external_id)
-    }, 'CAPI lead incoming');
-
     res.json({ ok: true, meta: resp });
   } catch (err) {
-    req.log?.error({ err }, 'Lead forwarding failed');
+    req.log?.error({ err }, 'Lead/Contact forwarding failed');
     res.status(err.status || 500).json({
       ok: false,
       error: err.message,
       details: err.details || null
     });
   }
-});
-
-app.listen(APP_PORT, () => {
-  logger.info(`Server listening on http://localhost:${APP_PORT}`);
 });
